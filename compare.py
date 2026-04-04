@@ -20,8 +20,9 @@ import textwrap
 
 import anthropic
 import psycopg2
+import psycopg2.extras
 
-from retrieval import graph_context, flat_context
+from retrieval import graph_context
 
 # ── config ────────────────────────────────────────────────────────────────────
 DB_CONFIG = dict(
@@ -48,6 +49,27 @@ SYSTEM_PROMPT = textwrap.dedent("""
     Highlight any contradictions or uncertainty you detect in the context.
     Do not invent information that is not in the context.
 """).strip()
+
+
+# ── flat export (raw edges only — no PAL intelligence) ───────────────────────
+def flat_context_raw(conn: psycopg2.extensions.connection) -> str:
+    """
+    Dump every edge as a plain triple: entity → relationship_type → target_entity.
+    No confidence scores, no timestamps, no SUPERSEDED labels, no chat source.
+    This is what a naive adjacency-list export looks like.
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT entity, relationship_type, target_entity "
+            "FROM knowledge_graph ORDER BY created_at ASC;"
+        )
+        rows = cur.fetchall()
+
+    lines = ["=== FLAT ADJACENCY LIST ==="]
+    for r in rows:
+        lines.append(f"{r['entity']} → {r['relationship_type']} → {r['target_entity']}")
+    lines.append("=== END ===")
+    return "\n".join(lines)
 
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
@@ -83,7 +105,7 @@ def main():
         g_ctx = graph_context(TEST_QUERY, conn, top_k=15, hops=2)
 
         print("Assembling flat context …")
-        f_ctx = flat_context(conn)
+        f_ctx = flat_context_raw(conn)
     finally:
         conn.close()
 

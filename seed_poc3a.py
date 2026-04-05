@@ -18,9 +18,10 @@ Input JSON format:
 Behaviour:
   Pass 1 — For each chat, call the Anthropic API to extract typed graph edges.
             Insert every extracted edge into knowledge_graph.
-  Pass 2 — For each edge that carries a supersedes_description, locate the most
-            recent prior edge with the same entity + relationship_type and set
-            its superseded_by field to the new edge's UUID.
+  Pass 2 — Pass all inserted nodes to Claude in chronological order. Claude
+            identifies supersession pairs semantically (same underlying fact,
+            later node updates or replaces the earlier one) and returns UUIDs.
+            Apply each pair by setting older_node.superseded_by = newer_uuid.
 """
 
 import argparse
@@ -107,6 +108,25 @@ def extract_relationships(
     return nodes if isinstance(nodes, list) else []
 
 
+# ── Supersession prompt ───────────────────────────────────────────────────────
+SUPERSESSION_PROMPT = """\
+Below is a list of graph nodes extracted from consulting chats in chronological order.
+Identify pairs where a later node supersedes an earlier node — meaning they represent
+the same underlying fact but the later one updates or replaces the earlier one.
+
+For each supersession pair output JSON:
+{{
+  "superseded_id": "UUID of the older node",
+  "superseding_id": "UUID of the newer node",
+  "reason": "brief explanation"
+}}
+
+Output a JSON array only. No explanation. No markdown.
+
+NODES:
+{nodes}"""
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 INSERT_SQL = """
     INSERT INTO knowledge_graph
@@ -118,22 +138,64 @@ INSERT_SQL = """
     RETURNING id;
 """
 
-FIND_PRIOR_SQL = """
-    SELECT id
-    FROM   knowledge_graph
-    WHERE  entity            = %(entity)s
-      AND  relationship_type = %(relationship_type)s
-      AND  created_at        < %(created_at)s
-      AND  superseded_by IS NULL
-    ORDER BY created_at DESC
-    LIMIT 1;
-"""
-
 SUPERSEDE_SQL = """
     UPDATE knowledge_graph
     SET    superseded_by = %(newer_id)s
     WHERE  id            = %(older_id)s;
 """
+
+
+def _strip_fences(raw: str) -> str:
+    """Remove markdown code fences if the model wraps its JSON response."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0]
+    return raw.strip()
+
+
+def find_supersession_pairs(
+    client: anthropic.Anthropic,
+    inserted: list[tuple[str, dict, datetime]],
+) -> list[dict]:
+    """
+    Pass all inserted nodes to Claude in chronological order.
+    Returns a list of {superseded_id, superseding_id, reason} dicts.
+    Returns [] if there are fewer than 2 nodes or the model finds no pairs.
+    """
+    if len(inserted) < 2:
+        return []
+
+    # Build a compact node list for the prompt, sorted by created_at
+    node_lines = []
+    for uid, node, created_at in sorted(inserted, key=lambda t: t[2]):
+        node_lines.append(
+            f"id={uid} | chat={node.get('chat_source','')} "
+            f"| date={created_at.strftime('%Y-%m-%d')} "
+            f"| entity={node.get('entity','')} "
+            f"| relationship_type={node.get('relationship_type','')} "
+            f"| target_entity={node.get('target_entity','')}"
+        )
+
+    prompt = SUPERSESSION_PROMPT.format(nodes="\n".join(node_lines))
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = _strip_fences(response.content[0].text)
+
+    try:
+        pairs = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"  [WARN] Supersession JSON parse error: {exc}", file=sys.stderr)
+        print(f"  Raw response:\n{raw[:500]}", file=sys.stderr)
+        return []
+
+    return pairs if isinstance(pairs, list) else []
 
 
 def insert_node(cur: psycopg2.extensions.cursor, node: dict, created_at: datetime) -> str:
@@ -201,38 +263,41 @@ def seed(json_path: str) -> None:
                           f"{node.get('target_entity','')}{sup_label}")
 
     print(f"\n{'─'*60}")
-    print(f"PASS 2 — Linking supersession chains")
+    print(f"PASS 2 — Linking supersession chains (LLM-identified)")
     print(f"{'─'*60}")
+
+    # Build a UUID lookup for validation
+    inserted_ids = {uid for uid, _, _ in inserted}
+
+    print(f"\n  Asking Claude to identify supersession pairs across {len(inserted)} node(s) …")
+    pairs = find_supersession_pairs(client, inserted)
+    print(f"  Claude identified {len(pairs)} pair(s)\n")
 
     supersession_count = 0
     with conn:
         with conn.cursor() as cur:
-            for new_uuid, node, created_at in inserted:
-                sup_desc = node.get("supersedes_description")
-                if not sup_desc:
+            for pair in pairs:
+                older_uuid    = str(pair.get("superseded_id", "")).strip()
+                newer_uuid    = str(pair.get("superseding_id", "")).strip()
+                reason        = str(pair.get("reason", "")).strip()
+
+                # Validate both UUIDs were actually inserted in this run
+                if older_uuid not in inserted_ids:
+                    print(f"  [WARN] superseded_id {older_uuid[:8]}… not in inserted set — skipping")
+                    continue
+                if newer_uuid not in inserted_ids:
+                    print(f"  [WARN] superseding_id {newer_uuid[:8]}… not in inserted set — skipping")
+                    continue
+                if older_uuid == newer_uuid:
+                    print(f"  [WARN] superseded_id == superseding_id ({older_uuid[:8]}…) — skipping")
                     continue
 
-                # Find the most recent prior edge with same entity + relationship_type
-                cur.execute(FIND_PRIOR_SQL, {
-                    "entity":            str(node.get("entity", "")).strip(),
-                    "relationship_type": str(node.get("relationship_type", "")).strip().upper(),
-                    "created_at":        created_at,
+                cur.execute(SUPERSEDE_SQL, {
+                    "newer_id": newer_uuid,
+                    "older_id": older_uuid,
                 })
-                row = cur.fetchone()
-                if row:
-                    older_uuid = str(row[0])
-                    cur.execute(SUPERSEDE_SQL, {
-                        "newer_id": new_uuid,
-                        "older_id": older_uuid,
-                    })
-                    supersession_count += 1
-                    print(f"  Superseded {older_uuid[:8]}… "
-                          f"→ {new_uuid[:8]}… "
-                          f"({node.get('entity','')} / {node.get('relationship_type','')})")
-                else:
-                    print(f"  [WARN] No prior node found to supersede for: "
-                          f"{node.get('entity','')} / {node.get('relationship_type','')} "
-                          f"— description: {sup_desc[:80]}")
+                supersession_count += 1
+                print(f"  Superseded {older_uuid[:8]}… → {newer_uuid[:8]}…  [{reason[:80]}]")
 
     conn.close()
     total = len(inserted)
